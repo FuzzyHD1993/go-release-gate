@@ -1,0 +1,12 @@
+# Build artifacts
+/goreleasegate
+goreleasegate
+*.exe
+*.test
+*.out
+coverage.*
+
+# Editor and OS files
+.DS_Store
+.idea/
+.vscode/
