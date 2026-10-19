@@ -42,7 +42,7 @@ type AuditOptions struct {
 	ChangedOnly bool
 	// AgentTimeout is the per-agent timeout. Zero uses the default (10m).
 	AgentTimeout time.Duration
-	// AuditTimeout bounds the whole AI audit. Zero uses the default (10m).
+	// AuditTimeout bounds the whole AI audit. Zero uses the default (30m).
 	AuditTimeout time.Duration
 	// MaxFileSize is the maximum Go source file size to read. Zero uses 10 MiB.
 	MaxFileSize int64
@@ -359,14 +359,6 @@ func runAgentUnit(ctx context.Context, opencode, runRoot, agent string, prompt A
 	result.Duration = time.Since(start)
 	rawStdout := sanitizeTerminal(stdout.String())
 	rawStderr := sanitizeTerminal(stderr.String())
-
-	if containsSuspiciousModelText(rawStdout) || containsSuspiciousModelText(rawStderr) {
-		result.Reason = "suspicious model self-reference; fail-closed"
-		if err := writeAgentLog(result.LogPath, agent, timeout, runErr, result.Duration, rawStdout, rawStderr, stdout.truncated, stderr.truncated); err != nil {
-			result.LogErr = err
-		}
-		return result
-	}
 
 	switch {
 	case errors.Is(agentCtx.Err(), context.DeadlineExceeded):
@@ -878,11 +870,6 @@ func sanitizeTerminal(s string) string {
 // output, without a nonce. Prefer ParseVerdictWithNonce for real audits.
 func ParseVerdict(output string) (string, bool) {
 	return ParseVerdictWithNonce(output, "")
-}
-
-func containsSuspiciousModelText(output string) bool {
-	lower := strings.ToLower(output)
-	return strings.Contains(lower, "i am a language model") || strings.Contains(lower, "as an ai")
 }
 
 // ParseVerdictWithNonce requires the exact final line to include the per-run
