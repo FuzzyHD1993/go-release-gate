@@ -48,6 +48,8 @@ func runCheck(args []string, stdout, stderr io.Writer) int {
 	project := fs.String("project", ".", "path to the Go project to check")
 	changedOnly := fs.Bool("changed-only", false, "audit only changed and untracked Go files")
 	aiTimeout := fs.Duration("timeout", defaultAITimeout, "per-agent AI audit timeout")
+	skipAI := fs.Bool("skip-ai", false, "run only basic checks without AI review")
+	sandboxImage := fs.String("sandbox-image", checks.DefaultSandboxImage, "container image for the sandboxed go test")
 
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
@@ -64,6 +66,10 @@ func runCheck(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintln(stderr, "--timeout must be greater than zero")
 		return 1
 	}
+	if *sandboxImage == "" {
+		fmt.Fprintln(stderr, "--sandbox-image must not be empty")
+		return 1
+	}
 
 	root, err := resolveProject(*project)
 	if err != nil {
@@ -77,7 +83,7 @@ func runCheck(args []string, stdout, stderr io.Writer) int {
 	defer stop()
 
 	fmt.Fprintln(stdout, "== Basic checks ==")
-	basicResults, basicErr := checks.RunBasicChecks(ctx, root)
+	basicResults, basicErr := checks.RunBasicChecksWithOptions(ctx, root, checks.BasicOptions{SandboxImage: *sandboxImage})
 	if len(basicResults) == 0 {
 		fmt.Fprintln(stdout, "no Go modules were checked")
 	}
@@ -97,23 +103,53 @@ func runCheck(args []string, stdout, stderr io.Writer) int {
 		return 1
 	}
 
+	if *skipAI {
+		fmt.Fprintln(stdout, "\n== AI audit ==")
+		fmt.Fprintln(stdout, "skipped (--skip-ai)")
+		fmt.Fprintln(stdout, "\nVERDICT: GO")
+		return 0
+	}
+
 	fmt.Fprintln(stdout, "\n== AI audit ==")
 	report, auditErr := checks.RunAIAudit(ctx, root, checks.AuditOptions{
 		ChangedOnly:  *changedOnly,
 		AgentTimeout: *aiTimeout,
 	})
 	if report != nil {
+		if len(report.PromptPaths) > 0 {
+			fmt.Fprintf(stdout, "prompts: %d\n", len(report.PromptPaths))
+		}
+		if report.SkippedSymlinks > 0 {
+			fmt.Fprintf(stdout, "skipped symlinks: %d\n", report.SkippedSymlinks)
+		}
 		for _, agent := range report.Agents {
 			fmt.Fprintf(stdout, "[%s] %s (%s)\n", agent.Verdict, agent.Agent, agent.Reason)
 			if agent.LogPath != "" {
-				fmt.Fprintf(stdout, "      log: %s\n", agent.LogPath)
+				fmt.Fprintf(stdout, "      log dir: %s\n", agent.LogPath)
+			}
+		}
+		shown := 0
+		for _, unit := range report.Units {
+			if unit.Verdict == checks.VerdictGO {
+				continue
+			}
+			if shown >= 10 {
+				fmt.Fprintln(stdout, "      ... more failing prompt units in the summary")
+				break
+			}
+			fmt.Fprintf(stdout, "[NO-GO] prompt %s (%s) %s: %s\n", unit.PromptID, unit.Label, unit.Agent, unit.Reason)
+			shown++
+		}
+		for _, file := range report.FileVerdicts {
+			if file.Verdict == checks.VerdictNoGo {
+				fmt.Fprintf(stdout, "[NO-GO] file %s (%d part(s))\n", file.Path, file.Parts)
 			}
 		}
 		if report.FallbackToAll {
 			fmt.Fprintln(stdout, "note: --changed-only found no changes; audited all Go files")
 		}
 		if report.OmittedFiles > 0 {
-			fmt.Fprintf(stdout, "coverage incomplete: %d Go file(s) omitted due to size limits\n", report.OmittedFiles)
+			fmt.Fprintf(stdout, "coverage incomplete: %d non-regular Go file(s) omitted\n", report.OmittedFiles)
 		}
 		if report.LogDir != "" {
 			fmt.Fprintf(stdout, "\nAudit logs: %s\n", report.LogDir)
@@ -124,7 +160,28 @@ func runCheck(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintln(stdout, "\nVERDICT: NO-GO")
 		return 1
 	}
-	if report == nil || !report.OverallGO {
+	overallGO := report != nil && report.OverallGO
+	if report != nil {
+		if len(report.Agents) == 0 {
+			overallGO = false
+		}
+		for _, agent := range report.Agents {
+			if agent.Verdict != checks.VerdictGO {
+				overallGO = false
+			}
+		}
+		for _, unit := range report.Units {
+			if unit.Verdict != checks.VerdictGO {
+				overallGO = false
+			}
+		}
+		for _, file := range report.FileVerdicts {
+			if file.Verdict != checks.VerdictGO {
+				overallGO = false
+			}
+		}
+	}
+	if report == nil || !overallGO {
 		fmt.Fprintln(stdout, "\nVERDICT: NO-GO")
 		return 1
 	}
@@ -158,10 +215,11 @@ func usage(w io.Writer) {
 
 Usage:
   goreleasegate check [--project PATH] [--changed-only] [--timeout DURATION]
+                      [--skip-ai] [--sandbox-image IMAGE]
   goreleasegate help
 
 Commands:
-  check    run go build, go vet, go test and a three-agent AI audit
+  check    run go build, go vet, sandboxed go test and a three-agent AI audit
   help     show this help
 
 Exit codes:
@@ -172,9 +230,14 @@ Exit codes:
 func checkUsage(w io.Writer) {
 	fmt.Fprintln(w, `Usage:
   goreleasegate check [--project PATH] [--changed-only] [--timeout DURATION]
+                      [--skip-ai] [--sandbox-image IMAGE]
 
 Flags:
   --project PATH       project root to check (default ".")
   --changed-only       audit only Go files changed or untracked relative to git HEAD
-  --timeout DURATION   per-agent AI audit timeout (default 10m)`)
+  --timeout DURATION   per-agent AI audit timeout (default 10m)
+  --skip-ai            run only basic checks, without AI review
+  --sandbox-image IMAGE
+                       container image for sandboxed go test
+                       (default "`+checks.DefaultSandboxImage+`")`)
 }

@@ -23,8 +23,10 @@ func TestRunCheckHelp(t *testing.T) {
 	if code := run([]string{"check", "--help"}, &stdout, &stderr); code != 0 {
 		t.Fatalf("exit code = %d, want 0", code)
 	}
-	if !strings.Contains(stderr.String(), "--project") {
-		t.Fatalf("check help missing --project: %q", stderr.String())
+	for _, want := range []string{"--project", "--skip-ai", "--sandbox-image"} {
+		if !strings.Contains(stderr.String(), want) {
+			t.Fatalf("check help missing %s: %q", want, stderr.String())
+		}
 	}
 }
 

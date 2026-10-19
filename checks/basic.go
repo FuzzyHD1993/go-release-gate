@@ -14,6 +14,16 @@ import (
 
 const goCommandTimeout = 5 * time.Minute
 
+// DefaultSandboxImage is the container image used for safe go test execution.
+const DefaultSandboxImage = "golang:1.27-alpine"
+
+// BasicOptions controls the basic checks.
+type BasicOptions struct {
+	// SandboxImage overrides the container image used for go test.
+	// Empty means DefaultSandboxImage.
+	SandboxImage string
+}
+
 // CheckResult describes one command executed as part of the basic checks.
 type CheckResult struct {
 	Module   string
@@ -78,7 +88,13 @@ func FindModules(root string) ([]string, error) {
 			return nil
 		}
 		if d.Type()&os.ModeSymlink != 0 {
-			return fmt.Errorf("symlinks are not allowed in project tree: %s", path)
+			// Follow only symlinks that resolve to a regular file inside the
+			// project. Broken/out-of-root links are ignored.
+			_, _, ok, _ := resolveWithinRoot(root, path)
+			if ok && d.Name() == "go.mod" {
+				modules = append(modules, filepath.Dir(path))
+			}
+			return nil
 		}
 		if d.Name() == "go.mod" {
 			modules = append(modules, filepath.Dir(path))
@@ -96,9 +112,29 @@ func FindModules(root string) ([]string, error) {
 	return modules, nil
 }
 
-// RunBasicChecks runs go build, go vet and go test in every module below root.
-// It keeps checking after a failure so all problems are reported at once.
+// RunBasicChecks runs go build, go vet and sandboxed go test in every module
+// below root. It uses the default sandbox image.
 func RunBasicChecks(ctx context.Context, root string) ([]CheckResult, error) {
+	return RunBasicChecksWithOptions(ctx, root, BasicOptions{})
+}
+
+// RunBasicChecksWithOptions runs go build, go vet and a Podman-sandboxed go
+// test in every module below root. It keeps checking after a failure so all
+// problems are reported at once.
+func RunBasicChecksWithOptions(ctx context.Context, root string, opts BasicOptions) ([]CheckResult, error) {
+	if opts.SandboxImage == "" {
+		opts.SandboxImage = DefaultSandboxImage
+	}
+
+	podman, err := exec.LookPath("podman")
+	if err != nil {
+		return nil, errors.New("Podman required for safe testing")
+	}
+	podman, err = filepath.Abs(podman)
+	if err != nil {
+		return nil, fmt.Errorf("resolve podman executable: %w", err)
+	}
+
 	modules, err := FindModules(root)
 	if err != nil {
 		return nil, err
@@ -125,7 +161,12 @@ func RunBasicChecks(ctx context.Context, root string) ([]CheckResult, error) {
 		}
 
 		for _, command := range []string{"build", "vet", "test"} {
-			result := runGoCommand(ctx, module, command)
+			var result CheckResult
+			if command == "test" {
+				result = runPodmanTest(ctx, podman, root, module, opts.SandboxImage)
+			} else {
+				result = runGoCommand(ctx, module, command)
+			}
 			results = append(results, result)
 			if !result.Success {
 				failures = append(failures, result)
@@ -151,6 +192,14 @@ func containsGoFiles(dir string) (bool, error) {
 			}
 			return nil
 		}
+		if d.Type()&os.ModeSymlink != 0 {
+			_, _, ok, _ := resolveWithinRoot(dir, path)
+			if ok && strings.HasSuffix(d.Name(), ".go") {
+				found = true
+				return filepath.SkipAll
+			}
+			return nil
+		}
 		if strings.HasSuffix(d.Name(), ".go") {
 			found = true
 			return filepath.SkipAll
@@ -170,15 +219,7 @@ func runGoCommand(parent context.Context, module, command string) CheckResult {
 		modFlag = "-mod=vendor"
 	}
 	args := []string{command, modFlag}
-	if command == "test" {
-		args = append(args, "-count=1")
-	}
-	args = append(args, "./...")
-
-	result := CheckResult{
-		Module:  module,
-		Command: "go " + strings.Join(args, " "),
-	}
+	result := CheckResult{Module: module, Command: "go " + strings.Join(args, " ")}
 	start := time.Now()
 
 	ctx, cancel := context.WithTimeout(parent, goCommandTimeout)
@@ -197,26 +238,132 @@ func runGoCommand(parent context.Context, module, command string) CheckResult {
 		return result
 	}
 
+	if command == "build" {
+		mainPackages, err := hasMainPackages(ctx, goBin, module, modFlag)
+		if err != nil {
+			result.Duration = time.Since(start)
+			result.Output = err.Error()
+			return result
+		}
+		if mainPackages {
+			// Write compiled binaries outside the audited tree.
+			dir, err := os.MkdirTemp("", "gorelease-build-")
+			if err != nil {
+				result.Duration = time.Since(start)
+				result.Output = fmt.Sprintf("create build output directory: %v", err)
+				return result
+			}
+			defer os.RemoveAll(dir)
+			args = append(args, "-o", dir+string(os.PathSeparator))
+		}
+	}
+	args = append(args, "./...")
+	result.Command = "go " + strings.Join(args, " ")
+
 	cmd := exec.CommandContext(ctx, goBin, args...)
 	cmd.Dir = module
 	cmd.Env = append(os.Environ(), "GOTOOLCHAIN=local")
 
-	var output limitedBuffer
-	output.max = maxAgentOutput
-	cmd.Stdout = &output
-	cmd.Stderr = &output
+	var stdout, stderr limitedBuffer
+	stdout.max = maxAgentOutput
+	stderr.max = maxAgentOutput
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
 	configureProcessGroup(cmd)
 
 	runErr := cmd.Run()
 	result.Duration = time.Since(start)
-	result.Output = sanitizeTerminal(strings.TrimRight(output.String(), "\n"))
-	if output.truncated {
+	result.Output = sanitizeTerminal(strings.TrimRight(joinOutput(stdout.String(), stderr.String()), "\n"))
+	if stdout.truncated || stderr.truncated {
 		result.Output = joinOutput(result.Output, fmt.Sprintf("[output truncated at %d bytes]", maxAgentOutput))
 	}
 
 	if runErr == nil {
 		result.Success = true
 		// Successful output is not printed, so do not retain it in memory.
+		result.Output = ""
+		return result
+	}
+
+	result.Success = false
+	if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+		result.Output = joinOutput(result.Output, fmt.Sprintf("command timed out after %s", goCommandTimeout))
+	} else {
+		result.Output = joinOutput(result.Output, runErr.Error())
+	}
+	return result
+}
+
+func hasMainPackages(parent context.Context, goBin, module, modFlag string) (bool, error) {
+	ctx, cancel := context.WithTimeout(parent, 30*time.Second)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, goBin, "list", modFlag, "-f", `{{if eq .Name "main"}}{{.ImportPath}}{{end}}`, "./...")
+	cmd.Dir = module
+	cmd.Env = append(os.Environ(), "GOTOOLCHAIN=local")
+
+	var stdout, stderr limitedBuffer
+	stdout.max = maxAgentOutput
+	stderr.max = maxAgentOutput
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	configureProcessGroup(cmd)
+
+	if err := cmd.Run(); err != nil {
+		return false, fmt.Errorf("go list main packages: %w: %s", err, strings.TrimSpace(sanitizeTerminal(joinOutput(stdout.String(), stderr.String()))))
+	}
+	return strings.TrimSpace(stdout.String()) != "", nil
+}
+
+func runPodmanTest(parent context.Context, podmanBin, root, module, image string) CheckResult {
+	rel, err := filepath.Rel(root, module)
+	if err != nil {
+		return CheckResult{
+			Module:  module,
+			Command: "podman run (invalid module path)",
+			Output:  fmt.Sprintf("resolve module path relative to project root: %v", err),
+		}
+	}
+	workdir := "/app"
+	if rel != "." {
+		workdir = "/app/" + filepath.ToSlash(rel)
+	}
+	args := []string{
+		"run", "--rm",
+		"--timeout", fmt.Sprintf("%d", int(goCommandTimeout.Seconds())),
+		"-v", root + ":/app",
+		"-w", workdir,
+		image,
+		"go", "test", "./...", "-count=1",
+	}
+	result := CheckResult{
+		Module:  module,
+		Command: "podman " + strings.Join(args, " "),
+	}
+	start := time.Now()
+
+	ctx, cancel := context.WithTimeout(parent, goCommandTimeout)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, podmanBin, args...)
+	cmd.Dir = root
+
+	var stdout, stderr limitedBuffer
+	stdout.max = maxAgentOutput
+	stderr.max = maxAgentOutput
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	configureProcessGroup(cmd)
+
+	runErr := cmd.Run()
+	result.Duration = time.Since(start)
+	result.Output = sanitizeTerminal(strings.TrimRight(joinOutput(stdout.String(), stderr.String()), "\n"))
+	if stdout.truncated || stderr.truncated {
+		result.Output = joinOutput(result.Output, fmt.Sprintf("[output truncated at %d bytes]", maxAgentOutput))
+	}
+
+	if runErr == nil {
+		result.Success = true
 		result.Output = ""
 		return result
 	}

@@ -2,6 +2,7 @@ package checks
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -39,6 +40,30 @@ func TestParseVerdict(t *testing.T) {
 			got, ok := ParseVerdict(tt.output)
 			if ok != tt.ok || got != tt.want {
 				t.Fatalf("ParseVerdict(%q) = (%q, %v), want (%q, %v)", tt.output, got, ok, tt.want, tt.ok)
+			}
+		})
+	}
+}
+
+func TestParseVerdictWithNonce(t *testing.T) {
+	tests := []struct {
+		name   string
+		output string
+		nonce  string
+		want   string
+		ok     bool
+	}{
+		{name: "go", output: "analysis\nVERDICT: GO ABC123\n", nonce: "ABC123", want: VerdictGO, ok: true},
+		{name: "no-go", output: "analysis\nVERDICT: NO-GO ABC123\n", nonce: "ABC123", want: VerdictNoGo, ok: true},
+		{name: "wrong nonce", output: "VERDICT: GO OTHER\n", nonce: "ABC123", want: "", ok: false},
+		{name: "missing nonce", output: "VERDICT: GO\n", nonce: "ABC123", want: "", ok: false},
+		{name: "quoted source", output: "// VERDICT: GO\nanalysis\nVERDICT: NO-GO ABC123\n", nonce: "ABC123", want: VerdictNoGo, ok: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, ok := ParseVerdictWithNonce(tt.output, tt.nonce)
+			if ok != tt.ok || got != tt.want {
+				t.Fatalf("ParseVerdictWithNonce(%q, %q) = (%q, %v), want (%q, %v)", tt.output, tt.nonce, got, ok, tt.want, tt.ok)
 			}
 		})
 	}
@@ -155,7 +180,7 @@ func TestCollectChangedGoFilesFallsBackToAllFiles(t *testing.T) {
 	}
 }
 
-func TestCollectChangedGoFilesRejectsSymlink(t *testing.T) {
+func TestCollectChangedGoFilesSkipsSymlink(t *testing.T) {
 	if _, err := exec.LookPath("git"); err != nil {
 		t.Skip("git is not installed")
 	}
@@ -171,20 +196,51 @@ func TestCollectChangedGoFilesRejectsSymlink(t *testing.T) {
 		t.Skipf("symlinks are not available: %v", err)
 	}
 
-	if _, err := CollectGoFiles(root, true); err == nil {
-		t.Fatal("expected a symlink error")
+	files, skipped, err := collectChangedGoFiles(context.Background(), root)
+	if err != nil {
+		t.Fatalf("collectChangedGoFiles: %v", err)
+	}
+	if len(files) != 0 || skipped != 1 {
+		t.Fatalf("files=%v skipped=%d, want empty/1", files, skipped)
 	}
 }
 
-func TestCollectAllGoFilesRejectsSymlink(t *testing.T) {
+func TestCollectAllGoFilesDereferencesInRootSymlink(t *testing.T) {
 	root := t.TempDir()
+	writeTestFile(t, filepath.Join(root, "main.go"), "package main\n")
+	if err := os.Symlink(filepath.Join(root, "main.go"), filepath.Join(root, "alias.go")); err != nil {
+		t.Skipf("symlinks are not available: %v", err)
+	}
+	files, skipped, err := collectAllGoFiles(root)
+	if err != nil {
+		t.Fatalf("collectAllGoFiles: %v", err)
+	}
+	if len(files) != 2 || skipped != 0 {
+		t.Fatalf("files=%v skipped=%d, want both files and 0 skipped", files, skipped)
+	}
+	prompts, included, omitted, skippedBuild, err := BuildPrompts(root, files)
+	if err != nil {
+		t.Fatalf("BuildPrompts: %v", err)
+	}
+	if len(prompts) == 0 || len(included) != 2 || omitted != 0 || skippedBuild != 0 {
+		t.Fatalf("prompts=%d included=%v omitted=%d skipped=%d", len(prompts), included, omitted, skippedBuild)
+	}
+}
+
+func TestCollectAllGoFilesSkipsSymlink(t *testing.T) {
+	root := t.TempDir()
+	writeTestFile(t, filepath.Join(root, "main.go"), "package main\n")
 	outside := filepath.Join(t.TempDir(), "secret.go")
 	writeTestFile(t, outside, "package secret\n")
 	if err := os.Symlink(outside, filepath.Join(root, "link.go")); err != nil {
 		t.Skipf("symlinks are not available: %v", err)
 	}
-	if _, err := CollectGoFiles(root, false); err == nil {
-		t.Fatal("expected a symlink error")
+	files, skipped, err := collectAllGoFiles(root)
+	if err != nil {
+		t.Fatalf("collectAllGoFiles: %v", err)
+	}
+	if len(files) != 1 || files[0] != filepath.Join(root, "main.go") || skipped != 1 {
+		t.Fatalf("files=%v skipped=%d", files, skipped)
 	}
 }
 
@@ -226,22 +282,39 @@ func TestBuildPrompt(t *testing.T) {
 	}
 }
 
-func TestBuildPromptOmitsOversizedFiles(t *testing.T) {
+func TestBuildPromptsSplitsLargeFile(t *testing.T) {
 	root := t.TempDir()
 	small := filepath.Join(root, "small.go")
 	big := filepath.Join(root, "big.go")
 	writeTestFile(t, small, "package main\n")
 	writeTestFile(t, big, strings.Repeat("// filler\n", 40_000))
 
-	prompt, included, omitted, err := BuildPrompt(root, []string{small, big})
+	prompts, included, omitted, skipped, err := BuildPrompts(root, []string{small, big})
 	if err != nil {
-		t.Fatalf("BuildPrompt: %v", err)
+		t.Fatalf("BuildPrompts: %v", err)
 	}
-	if omitted != 1 || len(included) != 1 || included[0] != "small.go" {
-		t.Fatalf("included=%v omitted=%d", included, omitted)
+	if omitted != 0 || skipped != 0 {
+		t.Fatalf("omitted=%d skipped=%d, want 0/0", omitted, skipped)
 	}
-	if !strings.Contains(prompt, "omitted due to size limits") {
-		t.Fatalf("prompt lacks omission note")
+	if len(included) != 2 {
+		t.Fatalf("included=%v, want both files", included)
+	}
+	var bigParts []AuditPrompt
+	for _, prompt := range prompts {
+		if len(prompt.Files) == 1 && prompt.Files[0] == "big.go" {
+			bigParts = append(bigParts, prompt)
+		}
+	}
+	if len(bigParts) < 2 {
+		t.Fatalf("big.go was not chunked: %d prompt(s)", len(bigParts))
+	}
+	for i, prompt := range bigParts {
+		if prompt.Part != i+1 || prompt.Parts != len(bigParts) {
+			t.Fatalf("part metadata = %d/%d, want %d/%d", prompt.Part, prompt.Parts, i+1, len(bigParts))
+		}
+		if !strings.Contains(prompt.Text, fmt.Sprintf("Часть %d из %d файла big.go", i+1, len(bigParts))) {
+			t.Fatalf("prompt lacks chunk marker for part %d", i+1)
+		}
 	}
 }
 
@@ -255,8 +328,9 @@ func TestBuildPromptRejectsOutsideRoot(t *testing.T) {
 	}
 }
 
-func TestBuildPromptRejectsSymlink(t *testing.T) {
+func TestBuildPromptsSkipsSymlink(t *testing.T) {
 	root := t.TempDir()
+	writeTestFile(t, filepath.Join(root, "main.go"), "package main\n")
 	outside := filepath.Join(t.TempDir(), "outside.go")
 	writeTestFile(t, outside, "package outside\n")
 	link := filepath.Join(root, "link.go")
@@ -264,8 +338,15 @@ func TestBuildPromptRejectsSymlink(t *testing.T) {
 		t.Skipf("symlinks are not available: %v", err)
 	}
 
-	if _, _, _, err := BuildPrompt(root, []string{link}); err == nil {
-		t.Fatal("expected a symlink error")
+	prompts, included, omitted, skipped, err := BuildPrompts(root, []string{filepath.Join(root, "main.go"), link})
+	if err != nil {
+		t.Fatalf("BuildPrompts: %v", err)
+	}
+	if len(prompts) == 0 || omitted != 0 || skipped != 1 {
+		t.Fatalf("prompts=%d omitted=%d skipped=%d", len(prompts), omitted, skipped)
+	}
+	if len(included) != 1 || included[0] != "main.go" {
+		t.Fatalf("included=%v, want main.go", included)
 	}
 }
 
@@ -301,11 +382,12 @@ func newAuditFixture(t *testing.T) string {
 func TestRunAIAuditAllGO(t *testing.T) {
 	root := newAuditFixture(t)
 	fakeOpenCode(t, `#!/bin/sh
+nonce=$(sed -n 's/^VERDICT: GO //p' | head -1)
 agent="$3"
 case "$agent" in
-  deepseek) echo "review by deepseek"; echo "VERDICT: GO";;
-  glm) echo "review by glm"; echo "VERDICT: GO";;
-  bunny) echo "review by bunny"; echo "VERDICT: GO";;
+  deepseek) echo "review by deepseek"; echo "VERDICT: GO $nonce";;
+  glm) echo "review by glm"; echo "VERDICT: GO $nonce";;
+  bunny) echo "review by bunny"; echo "VERDICT: GO $nonce";;
   *) echo "unknown agent $agent"; exit 2;;
 esac
 `)
@@ -328,10 +410,18 @@ esac
 			t.Fatalf("agent log missing: %v", err)
 		}
 	}
-	for _, name := range []string{"prompt.txt", "summary.txt", "deepseek.log", "glm.log", "bunny.log"} {
+	for _, name := range []string{"prompt-000.txt", "summary.txt"} {
 		if _, err := os.Stat(filepath.Join(report.LogDir, name)); err != nil {
 			t.Fatalf("%s missing: %v", name, err)
 		}
+	}
+	for _, agent := range []string{"deepseek", "glm", "bunny"} {
+		if _, err := os.Stat(filepath.Join(report.LogDir, agent, "000.log")); err != nil {
+			t.Fatalf("%s log missing: %v", agent, err)
+		}
+	}
+	if len(report.Units) != 3 || len(report.FileVerdicts) != 1 {
+		t.Fatalf("units=%d fileVerdicts=%d, want 3/1", len(report.Units), len(report.FileVerdicts))
 	}
 	summary, err := os.ReadFile(report.SummaryPath)
 	if err != nil {
@@ -349,11 +439,16 @@ esac
 	}
 }
 
-func TestRunAIAuditOmittedFilesForcesNoGo(t *testing.T) {
+func TestRunAIAuditChunksLargeFile(t *testing.T) {
 	root := newAuditFixture(t)
 	writeTestFile(t, filepath.Join(root, "big.go"), strings.Repeat("// filler\n", 40_000))
 	fakeOpenCode(t, `#!/bin/sh
-echo "VERDICT: GO"
+prompt=$(cat)
+nonce=$(printf '%s\n' "$prompt" | sed -n 's/^VERDICT: GO //p' | head -1)
+case "$prompt" in
+  *"Часть 2 из"*) echo "second chunk is bad"; echo "VERDICT: NO-GO $nonce";;
+  *) echo "VERDICT: GO $nonce";;
+esac
 `)
 
 	report, err := RunAIAudit(context.Background(), root, AuditOptions{AgentTimeout: 30 * time.Second})
@@ -361,27 +456,40 @@ echo "VERDICT: GO"
 		t.Fatalf("RunAIAudit: %v", err)
 	}
 	if report.OverallGO {
-		t.Fatal("OverallGO = true, want false for omitted coverage")
+		t.Fatal("OverallGO = true, want false for a NO-GO chunk")
 	}
-	if report.OmittedFiles == 0 {
-		t.Fatal("OmittedFiles = 0, want > 0")
+	if len(report.PromptPaths) < 2 {
+		t.Fatalf("prompts=%d, want at least 2 (chunking)", len(report.PromptPaths))
+	}
+	if len(report.Units) < 6 {
+		t.Fatalf("units=%d, want at least 6 (2 chunks x 3 agents)", len(report.Units))
+	}
+	var bigVerdict *FileVerdict
+	for i := range report.FileVerdicts {
+		if report.FileVerdicts[i].Path == "big.go" {
+			bigVerdict = &report.FileVerdicts[i]
+		}
+	}
+	if bigVerdict == nil || bigVerdict.Verdict != VerdictNoGo || bigVerdict.Parts < 2 {
+		t.Fatalf("big.go verdict = %+v, want NO-GO with multiple parts", bigVerdict)
 	}
 	summary, err := os.ReadFile(report.SummaryPath)
 	if err != nil {
 		t.Fatalf("read summary: %v", err)
 	}
-	if !strings.Contains(string(summary), "Coverage incomplete") || !strings.Contains(string(summary), "VERDICT: NO-GO") {
-		t.Fatalf("summary does not explain incomplete coverage:\n%s", summary)
+	if !strings.Contains(string(summary), "File verdicts:") || !strings.Contains(string(summary), "big.go: NO-GO") {
+		t.Fatalf("summary lacks chunked file verdict:\n%s", summary)
 	}
 }
 
 func TestRunAIAuditNoGoVerdicts(t *testing.T) {
 	root := newAuditFixture(t)
 	fakeOpenCode(t, `#!/bin/sh
+nonce=$(sed -n 's/^VERDICT: GO //p' | head -1)
 agent="$3"
 case "$agent" in
-  deepseek) echo "VERDICT: GO";;
-  glm) echo "VERDICT: NO-GO";;
+  deepseek) echo "VERDICT: GO $nonce";;
+  glm) echo "VERDICT: NO-GO $nonce";;
   bunny) echo "I have concerns but no final verdict";;
 esac
 `)
@@ -412,8 +520,9 @@ esac
 func TestRunAIAuditNonZeroExitForcesNoGo(t *testing.T) {
 	root := newAuditFixture(t)
 	fakeOpenCode(t, `#!/bin/sh
+nonce=$(sed -n 's/^VERDICT: GO //p' | head -1)
 agent="$3"
-echo "VERDICT: GO"
+echo "VERDICT: GO $nonce"
 if [ "$agent" = "deepseek" ]; then exit 1; fi
 exit 0
 `)
@@ -429,6 +538,30 @@ exit 0
 		if agent.Agent == "deepseek" && agent.Verdict != VerdictNoGo {
 			t.Fatalf("deepseek verdict = %s, want NO-GO", agent.Verdict)
 		}
+	}
+}
+
+func TestRunAIAuditSkipsSymlink(t *testing.T) {
+	root := newAuditFixture(t)
+	outside := filepath.Join(t.TempDir(), "secret.go")
+	writeTestFile(t, outside, "package secret\n")
+	if err := os.Symlink(outside, filepath.Join(root, "link.go")); err != nil {
+		t.Skipf("symlinks are not available: %v", err)
+	}
+	fakeOpenCode(t, `#!/bin/sh
+nonce=$(sed -n 's/^VERDICT: GO //p' | head -1)
+echo "VERDICT: GO $nonce"
+`)
+
+	report, err := RunAIAudit(context.Background(), root, AuditOptions{AgentTimeout: 30 * time.Second})
+	if err != nil {
+		t.Fatalf("RunAIAudit: %v", err)
+	}
+	if !report.OverallGO {
+		t.Fatalf("OverallGO = false, agents: %+v", report.Agents)
+	}
+	if report.SkippedSymlinks != 1 {
+		t.Fatalf("SkippedSymlinks = %d, want 1", report.SkippedSymlinks)
 	}
 }
 
