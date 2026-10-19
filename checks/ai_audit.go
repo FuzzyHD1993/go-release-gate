@@ -684,7 +684,8 @@ func BuildPrompt(root string, files []string) (string, []string, int, error) {
 	if omitted > 0 {
 		prompt.WriteString(fmt.Sprintf("[PROMPT TRUNCATED: %d additional Go file(s) omitted due to size limits]\n\n", omitted))
 	}
-	prompt.WriteString("End your response with exactly one of these lines, with nothing after it. Do not wrap it in a code fence or add punctuation:\n")
+	prompt.WriteString("Keep the review concise: at most 10 findings, then the final verdict.\n")
+	prompt.WriteString("End your response with exactly one of these lines, with nothing after it. Do not use bold, backticks, a code fence, or punctuation; output the line exactly as shown:\n")
 	prompt.WriteString("VERDICT: GO\n")
 	prompt.WriteString("VERDICT: NO-GO\n")
 	prompt.WriteString("Use GO only if the code is production-ready; otherwise use NO-GO.\n")
@@ -763,12 +764,9 @@ func ParseVerdict(output string) (string, bool) {
 		if line == "" {
 			continue
 		}
-		// The verdict must be the final non-empty line. Fences, blockquotes
-		// and headings are deliberately not stripped: only the agent's own
-		// final line can satisfy the gate.
-		line = strings.Trim(line, "*_ \t")
-		line = strings.NewReplacer("**", "", "__", "").Replace(line)
-		line = strings.TrimSuffix(strings.TrimSpace(line), ".")
+		// The verdict must be the exact final non-empty line. Markdown,
+		// fences, blockquotes and punctuation are rejected so a quoted source
+		// line cannot be mistaken for the agent's own verdict.
 		switch strings.ToUpper(line) {
 		case "VERDICT: GO":
 			return VerdictGO, true

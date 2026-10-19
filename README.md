@@ -21,10 +21,10 @@ If the basic checks pass, the tool sends the project's Go source to three
 - `glm` — bugs, error handling, resource leaks, concurrency
 - `bunny` — security and authorization
 
-Each agent must end with `VERDICT: GO` as the final non-empty line (not wrapped
-in a code fence). Any `VERDICT: NO-GO`, missing verdict, timeout, non-zero agent
-exit, truncated stdout, omitted source file, or failed log write makes the
-overall verdict `NO-GO`.
+Each agent must end with the exact final non-empty line `VERDICT: GO`, without
+markdown, backticks, a code fence, or punctuation. Any `VERDICT: NO-GO`, missing
+verdict, timeout, non-zero agent exit, truncated stdout, omitted source file, or
+failed log write makes the overall verdict `NO-GO`.
 
 ## Build
 
