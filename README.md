@@ -11,7 +11,10 @@ For every `go.mod` found in the target project (nested modules included):
 1. `go build ./...` locally
 2. `go vet ./...` locally
 3. `go test ./... -count=1` inside
-   `podman run --rm -v <module>:/app -w /app golang:1.27-alpine`
+   `podman run --rm --timeout 300 -v <project-root>:/app -w /app/<module> golang:1.27-alpine`
+
+The whole project is mounted so local `replace ../internal/platform` directives
+and multi-module layouts work; the workdir selects the module being tested.
 
 If any command fails, the gate returns `VERDICT: NO-GO` and does not spend time
 on the AI review. Podman is required; without it the gate fails with
@@ -31,8 +34,9 @@ Files larger than 200 KiB are split into chunks of at most 1000 lines or
 Each agent must end with the exact final non-empty line `VERDICT: GO`, without
 markdown, backticks, a code fence, or punctuation. Any `VERDICT: NO-GO`, missing
 verdict, timeout, non-zero agent exit, truncated stdout, omitted non-regular
-file, or failed log write makes the overall verdict `NO-GO`. Symlinks are
-skipped instead of aborting the audit.
+file, or failed log write makes the overall verdict `NO-GO`. Symlinks that
+resolve to regular files inside the project are dereferenced; broken or
+out-of-root symlinks are skipped instead of aborting the audit.
 
 ## Build
 
@@ -58,8 +62,9 @@ agents configured. No third-party Go dependencies.
 # Use a different test image
 ./goreleasegate check --project . --sandbox-image golang:1.27-alpine
 
-# Audit only Go files changed or untracked relative to git HEAD
-# (an empty change set falls back to auditing all Go files)
+# Audit only Go files changed or untracked relative to git HEAD.
+# Gitignored untracked Go files are included because Go still compiles them;
+# an empty change set falls back to auditing all Go files.
 ./goreleasegate check --project . --changed-only
 
 # Per-agent AI timeout (default 10m)
@@ -110,5 +115,6 @@ contain source code and model output, so treat them accordingly.
 - `vendor` and `testdata` directories are skipped, matching the Go tool's tree
   rules. Other directories (including `build`, `bin`, `dist`, and
   `node_modules`) are walked if they contain Go source.
-- Symlinks are skipped, so a project that keeps all Go code behind symlinks has
-  nothing to audit.
+- In-project symlinks are dereferenced; broken/out-of-root symlinks are skipped.
+  A project that keeps all Go code behind out-of-root symlinks has nothing to
+  audit.
