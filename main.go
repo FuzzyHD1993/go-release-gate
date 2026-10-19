@@ -9,13 +9,14 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strconv"
 	"syscall"
 	"time"
 
 	"go-release-gate/checks"
 )
 
-const defaultAITimeout = 10 * time.Minute
+const defaultAITimeout = 30 * time.Minute
 
 func main() {
 	os.Exit(run(os.Args[1:], os.Stdout, os.Stderr))
@@ -47,9 +48,10 @@ func runCheck(args []string, stdout, stderr io.Writer) int {
 
 	project := fs.String("project", ".", "path to the Go project to check")
 	changedOnly := fs.Bool("changed-only", false, "audit only changed and untracked Go files")
-	aiTimeout := fs.Duration("timeout", defaultAITimeout, "per-agent AI audit timeout")
+	aiTimeout := fs.Duration("timeout", defaultAITimeout, "overall AI audit timeout")
 	skipAI := fs.Bool("skip-ai", false, "run only basic checks without AI review")
 	sandboxImage := fs.String("sandbox-image", checks.DefaultSandboxImage, "container image for the sandboxed go test")
+	maxFileSize := fs.Int64("max-file-size", checks.DefaultMaxFileSize, "maximum Go source file size in bytes")
 
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
@@ -68,6 +70,10 @@ func runCheck(args []string, stdout, stderr io.Writer) int {
 	}
 	if *sandboxImage == "" {
 		fmt.Fprintln(stderr, "--sandbox-image must not be empty")
+		return 1
+	}
+	if *maxFileSize <= 0 {
+		fmt.Fprintln(stderr, "--max-file-size must be greater than zero")
 		return 1
 	}
 
@@ -114,6 +120,8 @@ func runCheck(args []string, stdout, stderr io.Writer) int {
 	report, auditErr := checks.RunAIAudit(ctx, root, checks.AuditOptions{
 		ChangedOnly:  *changedOnly,
 		AgentTimeout: *aiTimeout,
+		AuditTimeout: *aiTimeout,
+		MaxFileSize:  *maxFileSize,
 	})
 	if report != nil {
 		if len(report.PromptPaths) > 0 {
@@ -215,7 +223,7 @@ func usage(w io.Writer) {
 
 Usage:
   goreleasegate check [--project PATH] [--changed-only] [--timeout DURATION]
-                      [--skip-ai] [--sandbox-image IMAGE]
+                      [--skip-ai] [--sandbox-image IMAGE] [--max-file-size BYTES]
   goreleasegate help
 
 Commands:
@@ -230,14 +238,17 @@ Exit codes:
 func checkUsage(w io.Writer) {
 	fmt.Fprintln(w, `Usage:
   goreleasegate check [--project PATH] [--changed-only] [--timeout DURATION]
-                      [--skip-ai] [--sandbox-image IMAGE]
+                      [--skip-ai] [--sandbox-image IMAGE] [--max-file-size BYTES]
 
 Flags:
   --project PATH       project root to check (default ".")
   --changed-only       audit only Go files changed or untracked relative to git HEAD
-  --timeout DURATION   per-agent AI audit timeout (default 10m)
+  --timeout DURATION   overall AI audit timeout (default 30m)
   --skip-ai            run only basic checks, without AI review
   --sandbox-image IMAGE
                        container image for sandboxed go test
-                       (default "`+checks.DefaultSandboxImage+`")`)
+                       (default "`+checks.DefaultSandboxImage+`")
+  --max-file-size BYTES
+                       maximum Go source file size to read
+                       (default `+strconv.FormatInt(checks.DefaultMaxFileSize, 10)+`)`)
 }

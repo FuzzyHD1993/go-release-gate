@@ -134,6 +134,10 @@ func RunBasicChecksWithOptions(ctx context.Context, root string, opts BasicOptio
 	if err != nil {
 		return nil, fmt.Errorf("resolve podman executable: %w", err)
 	}
+	goModCache, err := moduleCachePath()
+	if err != nil {
+		return nil, err
+	}
 
 	modules, err := FindModules(root)
 	if err != nil {
@@ -163,7 +167,7 @@ func RunBasicChecksWithOptions(ctx context.Context, root string, opts BasicOptio
 		for _, command := range []string{"build", "vet", "test"} {
 			var result CheckResult
 			if command == "test" {
-				result = runPodmanTest(ctx, podman, root, module, opts.SandboxImage)
+				result = runPodmanTest(ctx, podman, root, module, opts.SandboxImage, goModCache)
 			} else {
 				result = runGoCommand(ctx, module, command)
 			}
@@ -315,7 +319,22 @@ func hasMainPackages(parent context.Context, goBin, module, modFlag string) (boo
 	return strings.TrimSpace(stdout.String()) != "", nil
 }
 
-func runPodmanTest(parent context.Context, podmanBin, root, module, image string) CheckResult {
+func moduleCachePath() (string, error) {
+	cache := os.Getenv("GOMODCACHE")
+	if cache == "" {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return "", fmt.Errorf("resolve home directory for Go module cache: %w", err)
+		}
+		cache = filepath.Join(home, "go", "pkg", "mod")
+	}
+	if err := os.MkdirAll(cache, 0o755); err != nil {
+		return "", fmt.Errorf("create Go module cache %s: %w", cache, err)
+	}
+	return cache, nil
+}
+
+func runPodmanTest(parent context.Context, podmanBin, root, module, image, goModCache string) CheckResult {
 	rel, err := filepath.Rel(root, module)
 	if err != nil {
 		return CheckResult{
@@ -330,8 +349,23 @@ func runPodmanTest(parent context.Context, podmanBin, root, module, image string
 	}
 	args := []string{
 		"run", "--rm",
+		"--read-only",
+		"--user", fmt.Sprintf("%d:%d", os.Getuid(), os.Getgid()),
+		"--cap-drop", "ALL",
+		"--network", "none",
+		"--security-opt", "no-new-privileges",
+		"--tmpfs", "/tmp:rw,noexec,nosuid,size=100m",
+		"--tmpfs", "/cache:rw,size=4g",
+		"-v", root + ":/app:ro",
+		"-v", goModCache + ":/go/pkg/mod:ro",
+		"-e", "HOME=/cache",
+		"-e", "GOCACHE=/cache",
+		"-e", "GOTMPDIR=/cache",
+		"-e", "TMPDIR=/cache",
+		"-e", "GOMODCACHE=/go/pkg/mod",
+		"-e", "GOPROXY=off",
+		"-e", "GOTOOLCHAIN=local",
 		"--timeout", fmt.Sprintf("%d", int(goCommandTimeout.Seconds())),
-		"-v", root + ":/app",
 		"-w", workdir,
 		image,
 		"go", "test", "./...", "-count=1",

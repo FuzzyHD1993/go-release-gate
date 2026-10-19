@@ -20,6 +20,9 @@ import (
 
 const (
 	defaultAgentTimeout = 10 * time.Minute
+	defaultMaxFileSize  = 10 * 1024 * 1024
+	// DefaultMaxFileSize is the default maximum Go source file size read by the AI audit.
+	DefaultMaxFileSize  = defaultMaxFileSize
 	maxPromptPayload    = 64 * 1024
 	maxAgentOutput      = 4 * 1024 * 1024
 	maxGitOutput        = 8 * 1024 * 1024
@@ -39,6 +42,10 @@ type AuditOptions struct {
 	ChangedOnly bool
 	// AgentTimeout is the per-agent timeout. Zero uses the default (10m).
 	AgentTimeout time.Duration
+	// AuditTimeout bounds the whole AI audit. Zero uses the default (10m).
+	AuditTimeout time.Duration
+	// MaxFileSize is the maximum Go source file size to read. Zero uses 10 MiB.
+	MaxFileSize int64
 }
 
 // AgentResult is the aggregated outcome of one AI reviewer across all prompts.
@@ -106,9 +113,22 @@ func RunAIAudit(ctx context.Context, root string, opts AuditOptions) (*AuditRepo
 	if opts.AgentTimeout <= 0 {
 		opts.AgentTimeout = defaultAgentTimeout
 	}
+	if opts.AuditTimeout <= 0 {
+		// A multi-prompt audit can easily outlive a single agent timeout.
+		opts.AuditTimeout = 30 * time.Minute
+	}
+	if opts.MaxFileSize <= 0 {
+		opts.MaxFileSize = defaultMaxFileSize
+	}
+	auditCtx, cancel := context.WithTimeout(ctx, opts.AuditTimeout)
+	defer cancel()
+	ctx = auditCtx
 
 	files, skippedCollect, fallback, err := collectGoFilesForAudit(ctx, absRoot, opts.ChangedOnly)
 	if err != nil {
+		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+			return nil, errors.New("AI audit timed out")
+		}
 		return nil, err
 	}
 	// Keep the user-facing verdict format exactly "VERDICT: GO"/"VERDICT: NO-GO".
@@ -116,11 +136,17 @@ func RunAIAudit(ctx context.Context, root string, opts AuditOptions) (*AuditRepo
 	// for callers that want stronger anti-spoofing, but the CLI uses the simple
 	// documented format.
 	nonce := ""
-	prompts, included, omitted, skippedBuild, err := BuildPromptsWithNonce(absRoot, files, nonce)
+	prompts, included, omitted, skippedBuild, err := BuildPromptsWithLimits(absRoot, files, nonce, opts.MaxFileSize)
 	if err != nil {
+		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+			return nil, errors.New("AI audit timed out")
+		}
 		return nil, err
 	}
 	skippedSymlinks := skippedCollect + skippedBuild
+	if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+		return nil, errors.New("AI audit timed out")
+	}
 
 	logDir, err := createAuditDir()
 	if err != nil {
@@ -223,7 +249,11 @@ func RunAIAudit(ctx context.Context, root string, opts AuditOptions) (*AuditRepo
 		}
 	}
 	if err := ctx.Err(); err != nil {
-		opErrs = append(opErrs, fmt.Errorf("audit context ended: %w", err))
+		if errors.Is(err, context.DeadlineExceeded) {
+			opErrs = append(opErrs, errors.New("AI audit timed out"))
+		} else {
+			opErrs = append(opErrs, fmt.Errorf("audit context ended: %w", err))
+		}
 	}
 	if len(opErrs) > 0 {
 		report.OverallGO = false
@@ -329,6 +359,14 @@ func runAgentUnit(ctx context.Context, opencode, runRoot, agent string, prompt A
 	result.Duration = time.Since(start)
 	rawStdout := sanitizeTerminal(stdout.String())
 	rawStderr := sanitizeTerminal(stderr.String())
+
+	if containsSuspiciousModelText(rawStdout) || containsSuspiciousModelText(rawStderr) {
+		result.Reason = "suspicious model self-reference; fail-closed"
+		if err := writeAgentLog(result.LogPath, agent, timeout, runErr, result.Duration, rawStdout, rawStderr, stdout.truncated, stderr.truncated); err != nil {
+			result.LogErr = err
+		}
+		return result
+	}
 
 	switch {
 	case errors.Is(agentCtx.Err(), context.DeadlineExceeded):
@@ -840,6 +878,11 @@ func sanitizeTerminal(s string) string {
 // output, without a nonce. Prefer ParseVerdictWithNonce for real audits.
 func ParseVerdict(output string) (string, bool) {
 	return ParseVerdictWithNonce(output, "")
+}
+
+func containsSuspiciousModelText(output string) bool {
+	lower := strings.ToLower(output)
+	return strings.Contains(lower, "i am a language model") || strings.Contains(lower, "as an ai")
 }
 
 // ParseVerdictWithNonce requires the exact final line to include the per-run

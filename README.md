@@ -10,11 +10,14 @@ For every `go.mod` found in the target project (nested modules included):
 
 1. `go build ./...` locally
 2. `go vet ./...` locally
-3. `go test ./... -count=1` inside
-   `podman run --rm --timeout 300 -v <project-root>:/app -w /app/<module> golang:1.27-alpine`
+3. `go test ./... -count=1` inside a hardened Podman container
+   (`golang:1.27-alpine` by default)
 
-The whole project is mounted so local `replace ../internal/platform` directives
-and multi-module layouts work; the workdir selects the module being tested.
+The container mounts the whole project read-only at `/app` (so local
+`replace ../internal/platform` directives and multi-module layouts work), sets
+the workdir to the module, drops capabilities, enables `no-new-privileges`,
+disables networking, and mounts the host Go module cache read-only with
+`GOPROXY=off`. A test that needs network access will fail by design.
 
 If any command fails, the gate returns `VERDICT: NO-GO` and does not spend time
 on the AI review. Podman is required; without it the gate fails with
@@ -27,8 +30,8 @@ If the basic checks pass, the tool sends the project's Go source to three
 - `glm` — bugs, error handling, resource leaks, concurrency
 - `bunny` — security and authorization
 
-Files larger than 200 KiB are split into chunks of at most 1000 lines or
-200 KiB. Every chunk is submitted separately with the marker
+Small files are grouped into prompts up to 64 KiB. Files larger than 200 KiB
+are split into chunks of at most 1000 lines or 200 KiB. Every chunk is submitted separately with the marker
 `Часть X из Y файла <name>`, and a file is `NO-GO` if any part is `NO-GO`.
 
 Each agent must end with the exact final non-empty line `VERDICT: GO`, without
@@ -67,8 +70,11 @@ agents configured. No third-party Go dependencies.
 # an empty change set falls back to auditing all Go files.
 ./goreleasegate check --project . --changed-only
 
-# Per-agent AI timeout (default 10m)
-./goreleasegate check --project . --timeout 15m
+# Overall AI audit timeout (default 30m)
+./goreleasegate check --project . --timeout 45m
+
+# Maximum source file size read into the audit (default 10 MiB)
+./goreleasegate check --project . --max-file-size 20971520
 ```
 
 Exit code `0` means every basic check passed and all AI prompt units returned
